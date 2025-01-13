@@ -1,0 +1,68 @@
+# Python cache and temporary files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+*.env
+*.venv
+other files/
+# git rm -r --cached other files/
+
+# Poetry-related files
+poetry.lock
+
+# PyCharm files
+.idea/
+*.iml
+*.ipr
+
+# Logs and other output
+*.log
+*.out
+*.err
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Test-related files
+htmlcov/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+
+# Build files
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Editor-specific files
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Temporary files
+*.tmp
+*.temp
+~$*
+
+# Backup files
+*.bak
+*.swp
+*.swo
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Local database and other runtime files
+*.sqlite3
+*.db

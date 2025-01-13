@@ -30,7 +30,7 @@
 }]]></component>
   <component name="GithubPullRequestsUISettings"><![CDATA[{
   "selectedUrlAndAccountId": {
-    "url": "https://github.com/informdanny/youtube_pipeline.git",
+    "url": "https://github.com/informdanny/learn_from.git",
     "accountId": "5d6f8349-3f35-47d8-ac2e-abd1d950538c"
   }
 }]]></component>
@@ -277,7 +277,15 @@
       <option name="project" value="LOCAL" />
       <updated>1736745712628</updated>
     </task>
-    <option name="localTasksCounter" value="8" />
+    <task id="LOCAL-00008" summary="Updating ignore other files/&#10;- Still need to add poetry Project Dependencies">
+      <option name="closed" value="true" />
+      <created>1736746975813</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1736746975813</updated>
+    </task>
+    <option name="localTasksCounter" value="9" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -296,9 +304,7 @@
                   <entry key="branch">
                     <value>
                       <list>
-                        <option value="HEAD" />
                         <option value="main" />
-                        <option value="origin/main" />
                       </list>
                     </value>
                   </entry>
