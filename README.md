@@ -14,6 +14,7 @@ Configure these variables through the deployment platform's secret manager:
 - `OPENAI_API_KEY`: required when hosted indexing is enabled.
 - `LEARN_FROM_COLLECTION_JOB_ID`: an existing saved collection job.
 - `LEARN_FROM_INDEX_AFTER_COLLECTION`: `true` or `false`; defaults to `true`.
+- `LEARN_FROM_INDEX_BEFORE_COLLECTION`: defaults to `false`; enable to index saved sources before collecting more. Pending or unresolved indexing stops the worker before acquisition.
 - `LEARN_FROM_MAX_INDEX_FILES`: maximum files considered in this invocation; defaults to `1000`.
 
 The saved collection determines the selected videos and provider-request cap. Reusable transcripts avoid acquisition calls. Reservations and uncertain outcomes survive process interruptions. Hosted index storage can incur ongoing charges independently of worker execution.
@@ -31,5 +32,7 @@ learn-from --help
 ```
 
 The `consult --prepare-only` option exports complete selected source evidence for review without making a Responses API model call. Hosted search may still be used when sources are selected by a collection job.
+
+Hosted consultations with multiple `--channel` values search each channel and reserve one complete transcript per channel. Missing evidence is reported without generating a comparison. Optional extra sources may be omitted to fit the full-document context limit; those omissions are recorded. The configured OpenAI key must have access to both the saved vector store and the answer model.
 
 Tests use isolated fixtures and mocked external calls. No credentials are included. The standalone transcript skill, private planning notes, provider payloads, outputs, and historical migration tests are outside this runtime snapshot.

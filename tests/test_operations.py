@@ -11,8 +11,10 @@ from learn_from import collections, consultation, hosted_retrieval, operations, 
 
 
 CHANNEL = "UC" + "a" * 22
+CHANNEL_B = "UC" + "b" * 22
 VIDEO_A = "a" * 11
 VIDEO_B = "b" * 11
+VIDEO_C = "c" * 11
 
 
 def parser():
@@ -228,3 +230,133 @@ def test_prepare_only_exports_complete_evidence_without_responses(monkeypatch, r
     assert result["coverage"]["read_video_ids"] == [VIDEO_A]
     assert result["evidence"][0]["text"] == transcript
     assert result["evidence"][0]["url"] == f"https://www.youtube.com/watch?v={VIDEO_A}"
+
+
+def balanced_args(*extra):
+    return consult_args("--channel", CHANNEL_B, *extra)
+
+
+def balanced_search(monkeypatch, *, missing_second=False):
+    def search(**kwargs):
+        channel = kwargs["channel_ids"][0]
+        videos = [VIDEO_A, VIDEO_A, VIDEO_C] if channel == CHANNEL else ([] if missing_second else [VIDEO_B, VIDEO_B])
+        return {"data": [{"attributes": {"video_id": video, "channel_id": channel}} for video in videos]}
+    mock = Mock(side_effect=search)
+    monkeypatch.setattr(hosted_retrieval, "hosted_search", mock)
+    return mock
+
+
+@pytest.mark.parametrize("prepare_only", [False, True])
+def test_balanced_selection_reads_both_channels_in_provider_order(monkeypatch, runtime, capsys, prepare_only):
+    search = balanced_search(monkeypatch)
+    sizes = Mock(return_value={VIDEO_A: {"channel_id": CHANNEL, "text_characters": 10000},
+                               VIDEO_B: {"channel_id": CHANNEL_B, "text_characters": 10000},
+                               VIDEO_C: {"channel_id": CHANNEL, "text_characters": 10000}})
+    monkeypatch.setattr(operations, "_complete_document_sizes", sizes)
+    consult = Mock(return_value={"status": "completed"})
+    read = Mock(return_value={"evidence": [], "coverage": {"complete_selected_documents": True}})
+    monkeypatch.setattr(consultation, "consult_published_views", consult)
+    monkeypatch.setattr(consultation, "read_consultation_documents", read)
+    # A repeated channel must not cause an additional search or consume a document slot.
+    args = balanced_args("--channel", CHANNEL, *(["--prepare-only"] if prepare_only else []))
+    assert operations.run_operation(args) == 0
+    assert [call.kwargs["channel_ids"] for call in search.call_args_list] == [[CHANNEL], [CHANNEL_B]]
+    sizes.assert_called_once_with(runtime[1], [CHANNEL, CHANNEL_B], [VIDEO_A, VIDEO_B, VIDEO_C])
+    active, inactive = (read, consult) if prepare_only else (consult, read)
+    active.assert_called_once()
+    inactive.assert_not_called()
+    assert active.call_args.kwargs["video_ids"] == [VIDEO_A, VIDEO_B, VIDEO_C]
+    assert active.call_args.kwargs["max_context_chars"] == 300000
+    output = json.loads(capsys.readouterr().out)
+    selection = output["source_selection"]
+    assert selection["required_video_ids"] == [VIDEO_A, VIDEO_B]
+    assert selection["by_channel"][CHANNEL_B]["selected_video_ids"] == [VIDEO_B]
+    assert selection["matched_passages"] == 5
+
+
+def test_balanced_missing_channel_writes_explicit_result_without_model(monkeypatch, runtime, tmp_path):
+    balanced_search(monkeypatch, missing_second=True)
+    monkeypatch.setattr(operations, "_complete_document_sizes", lambda *args: pytest.fail("Missing coverage must not read documents"))
+    monkeypatch.setattr(consultation, "consult_published_views", lambda **kwargs: pytest.fail("Missing coverage must not generate a comparison"))
+    target = tmp_path / "coverage" / "result.json"
+    assert operations.run_operation(balanced_args("--output", str(target))) == 0
+    result = json.loads(target.read_text())
+    assert result["status"] == "insufficient_channel_evidence"
+    assert result["coverage"]["missing_channel_ids"] == [CHANNEL_B]
+    assert result["coverage"]["read_video_ids"] == []
+    assert result["answer"] is None and result["model_request_made"] is False
+
+
+def test_balanced_document_cap_fails_before_search(monkeypatch, runtime, capsys):
+    monkeypatch.setattr(hosted_retrieval, "hosted_search", lambda **kwargs: pytest.fail("Invalid cap must not search"))
+    monkeypatch.setattr(operations, "_index_for_job", lambda *args: pytest.fail("Invalid cap must fail before index lookup"))
+    assert operations.run_operation(balanced_args("--max-documents", "1")) == 1
+    assert "one document per requested channel" in json.loads(capsys.readouterr().out)["message"]
+
+
+def test_balanced_context_limit_drops_only_optional_whole_document(monkeypatch, runtime, capsys):
+    balanced_search(monkeypatch)
+    sizes = Mock(return_value={VIDEO_A: {"channel_id": CHANNEL, "text_characters": 100000},
+                               VIDEO_B: {"channel_id": CHANNEL_B, "text_characters": 100000},
+                               VIDEO_C: {"channel_id": CHANNEL, "text_characters": 150000}})
+    monkeypatch.setattr(operations, "_complete_document_sizes", sizes)
+    consult = Mock(return_value={"status": "completed"})
+    monkeypatch.setattr(consultation, "consult_published_views", consult)
+    assert operations.run_operation(balanced_args()) == 0
+    sizes.assert_called_once()
+    assert consult.call_args.kwargs["video_ids"] == [VIDEO_A, VIDEO_B]
+    result = json.loads(capsys.readouterr().out)
+    assert result["source_selection"]["selected_text_characters"] == 200000
+    assert result["source_selection"]["omitted_documents"] == [{
+        "video_id": VIDEO_C, "channel_id": CHANNEL, "reason": "complete_document_context_limit", "text_characters": 150000}]
+
+
+def test_balanced_required_documents_over_limit_never_drop_a_channel(monkeypatch, runtime, capsys):
+    balanced_search(monkeypatch)
+    monkeypatch.setattr(operations, "_complete_document_sizes", lambda *args: {
+        VIDEO_A: {"channel_id": CHANNEL, "text_characters": 200000},
+        VIDEO_B: {"channel_id": CHANNEL_B, "text_characters": 150000},
+        VIDEO_C: {"channel_id": CHANNEL, "text_characters": 1000},
+    })
+    monkeypatch.setattr(consultation, "consult_published_views", lambda **kwargs: pytest.fail("Oversized required set must not call model"))
+    assert operations.run_operation(balanced_args()) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "context_limit_exceeded"
+    assert result["coverage"]["required_video_ids"] == [VIDEO_A, VIDEO_B]
+    assert result["coverage"]["required_text_characters"] == 350000
+    assert result["coverage"]["read_video_ids"] == []
+    assert result["answer"] is None and result["model_request_made"] is False
+
+
+def test_balanced_selection_rejects_mismatched_source_channel(monkeypatch, runtime):
+    balanced_search(monkeypatch)
+    monkeypatch.setattr(operations, "_complete_document_sizes", lambda *args: {
+        VIDEO_A: {"channel_id": CHANNEL, "text_characters": 1000},
+        VIDEO_B: {"channel_id": CHANNEL, "text_characters": 1000},
+        VIDEO_C: {"channel_id": CHANNEL, "text_characters": 1000},
+    })
+    monkeypatch.setattr(consultation, "consult_published_views", lambda **kwargs: pytest.fail("Mismatched attribution must not call model"))
+    assert operations.run_operation(balanced_args()) == 1
+
+
+def test_complete_document_sizes_use_latest_complete_nonempty_scoped_source():
+    from sqlalchemy import create_engine, text
+    engine = create_engine("sqlite:///:memory:")
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("CREATE TABLE channels (channel_id TEXT PRIMARY KEY)"))
+            connection.execute(text("CREATE TABLE media (media_id TEXT PRIMARY KEY, channel_id TEXT)"))
+            connection.execute(text("CREATE TABLE doc_content (content_id INTEGER PRIMARY KEY, media_id TEXT, chunk_type TEXT, full_text TEXT)"))
+            connection.execute(text("INSERT INTO channels VALUES (:id)"), [{"id": CHANNEL}, {"id": CHANNEL_B}])
+            connection.execute(text("INSERT INTO media VALUES (:video, :channel)"), [{"video": VIDEO_A, "channel": CHANNEL}, {"video": VIDEO_B, "channel": CHANNEL_B}])
+            connection.execute(text("INSERT INTO doc_content VALUES (:id, :video, :kind, :body)"), [
+                {"id": 1, "video": VIDEO_A, "kind": "complete", "body": "old text"},
+                {"id": 2, "video": VIDEO_A, "kind": "complete", "body": "é字"},
+                {"id": 3, "video": VIDEO_A, "kind": "segment", "body": "irrelevant partial"},
+                {"id": 4, "video": VIDEO_A, "kind": "complete", "body": "   "},
+                {"id": 5, "video": VIDEO_B, "kind": "complete", "body": "outside channel scope"},
+            ])
+        assert operations._complete_document_sizes(engine, [CHANNEL], [VIDEO_A, VIDEO_B]) == {
+            VIDEO_A: {"channel_id": CHANNEL, "text_characters": 2}}
+    finally:
+        engine.dispose()

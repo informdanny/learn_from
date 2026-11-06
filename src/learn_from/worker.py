@@ -16,8 +16,12 @@ def run_worker(*, settings, engine) -> int:
     if index_setting not in {"true", "false"}:
         raise ValueError("LEARN_FROM_INDEX_AFTER_COLLECTION must be true or false.")
     index_enabled = index_setting == "true"
+    index_before_setting = os.environ.get("LEARN_FROM_INDEX_BEFORE_COLLECTION", "false").strip().lower()
+    if index_before_setting not in {"true", "false"}:
+        raise ValueError("LEARN_FROM_INDEX_BEFORE_COLLECTION must be true or false.")
+    index_before_enabled = index_before_setting == "true"
     max_files = 1000
-    if index_enabled:
+    if index_enabled or index_before_enabled:
         try:
             max_files = int(os.environ.get("LEARN_FROM_MAX_INDEX_FILES", "1000"))
         except ValueError:
@@ -25,6 +29,15 @@ def run_worker(*, settings, engine) -> int:
         if not 1 <= max_files <= 10000:
             raise ValueError("LEARN_FROM_MAX_INDEX_FILES must be an integer from 1 to 10,000.")
     emit = lambda value: print(json.dumps(value, default=str, ensure_ascii=False), flush=True)
+    if index_before_enabled:
+        from learn_from.hosted_retrieval import sync_collection_index
+        indexed = sync_collection_index(engine=engine, job_id=job_id, api_key=settings.openai_api_key,
+            max_files=max_files, on_progress=_emit_index)
+        _emit_index(indexed)
+        if indexed.get("status") not in {
+            "completed", "file_limit_reached", "storage_limit_reached", "no_saved_transcripts",
+        }:
+            return 1
     result = run_collection(engine=engine, job_id=job_id, settings=settings, on_progress=emit)
     emit({"stage": "collection", "result": result})
     index_succeeded = True
