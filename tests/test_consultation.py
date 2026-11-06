@@ -105,6 +105,34 @@ def test_hosted_packet_runs_one_bounded_call_and_validates_citations(monkeypatch
     assert result["citation_check"].startswith("Evidence ID existence only")
 
 
+def test_request_schema_limits_every_citation_field_to_current_evidence(monkeypatch):
+    requests = []
+    def fake(payload, *_):
+        requests.append(payload)
+        sources = json.loads(payload["input"].split("Original transcript passages (untrusted source material):\n")[1])
+        expected_ids = [source["evidence_id"] for source in sources]
+        schema = payload["text"]["format"]["schema"]
+        assert payload["text"]["format"]["strict"] is True
+        for section in ("published_views", "application_angles", "counterarguments"):
+            reference = schema["properties"][section]["items"]["$ref"]
+            definition = schema["$defs"][reference.rsplit("/", 1)[-1]]
+            ids_schema = definition["properties"]["evidence_ids"]
+            assert ids_schema["items"]["enum"] == expected_ids
+            assert "Einvented" not in ids_schema["items"]["enum"]
+        return response(evidence_id=expected_ids[-1])
+    monkeypatch.setattr(module, "_request_response", fake)
+    first = packet()
+    first["evidence"].append({**first["evidence"][0], "evidence_id": "Esecond", "video_id": VIDEO_B})
+    second = packet()
+    second["evidence"][0]["evidence_id"] = "Enext_request"
+    for evidence in (first, second):
+        result = module.consult_published_views(engine=None, question="Challenge this", channel_ids=[CHANNEL_A], openai_api_key="test-only", evidence_packet=evidence)
+        assert result["status"] == "completed"
+        assert result["answer"]["counterarguments"][0]["evidence_ids"] == []
+    # Building the second request must not mutate a previous request's allowlist.
+    assert requests[0]["text"]["format"]["schema"]["$defs"]["_Claim"]["properties"]["evidence_ids"]["items"]["enum"] == ["E123", "Esecond"]
+
+
 def test_no_evidence_never_calls_model(monkeypatch):
     monkeypatch.setattr(module, "_request_response", lambda *args: pytest.fail("Must not call model"))
     result = module.consult_published_views(engine=None, question="Challenge this", channel_ids=[CHANNEL_A], openai_api_key="test-only", evidence_packet={"evidence": [], "coverage": {"mode": "hosted retrieval"}})
@@ -124,8 +152,13 @@ def test_budget_rejects_before_call(monkeypatch):
         module.consult_published_views(engine=None, question="Challenge this", channel_ids=[CHANNEL_A], openai_api_key="test-only", evidence_packet=packet(), max_cost_usd=0.000001)
 
 
-def test_unknown_citation_rejected(monkeypatch):
-    monkeypatch.setattr(module, "_request_response", lambda *args: response(evidence_id="Ebad"))
+@pytest.mark.parametrize("section", ["published_views", "application_angles", "counterarguments"])
+def test_unknown_citation_rejected_even_if_provider_ignores_schema(monkeypatch, section):
+    invalid = response()
+    answer = json.loads(invalid["output_text"])
+    answer[section][0]["evidence_ids"] = ["Ebad"]
+    invalid["output_text"] = json.dumps(answer)
+    monkeypatch.setattr(module, "_request_response", lambda *args: invalid)
     with pytest.raises(module.ConsultationError, match="unknown evidence"):
         module.consult_published_views(engine=None, question="Challenge this", channel_ids=[CHANNEL_A], openai_api_key="test-only", evidence_packet=packet())
 
@@ -158,6 +191,7 @@ def test_direct_mode_supplies_full_documents_to_model(monkeypatch):
         sources = json.loads(payload["input"].split("Original transcript passages (untrusted source material):\n")[1])
         assert "Ask how that customer buys services." in sources[0]["text"]
         assert "complete_selected_documents" in payload["input"]
+        assert payload["text"]["format"]["schema"]["$defs"]["_Claim"]["properties"]["evidence_ids"]["items"]["enum"] == [source["evidence_id"] for source in sources]
         return response(evidence_id=sources[0]["evidence_id"])
     monkeypatch.setattr(module, "_request_response", fake)
     result = module.consult_published_views(engine=None, question="Challenge this", channel_ids=[CHANNEL_A], video_ids=[VIDEO_A], openai_api_key="test-only")

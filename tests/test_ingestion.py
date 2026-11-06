@@ -63,7 +63,7 @@ def _build_test_engine():
         Column("formatted_text", Text),
         Column("timestamped_segments", JSON),
         Column("chunk_type", String(20), nullable=False, default="complete"),
-        Column("language", String(10), nullable=False, default="en"),
+        Column("language", Text, nullable=False, default="en"),
         Column("word_count", Integer),
         Column("character_count", Integer),
         Column("updated_at", DateTime),
@@ -346,7 +346,7 @@ def test_incomplete_or_wrong_language_transcript_is_fetched(
     assert find_reusable_transcript(engine=engine, video_id_or_url="dQw4w9WgXcQ") is not None
 
 
-@pytest.mark.parametrize("language", ["en-US", "es", None])
+@pytest.mark.parametrize("language", ["en-US", "en-Latn-US-fonipa", "es", None])
 def test_ingestion_preserves_provider_language(
     monkeypatch: pytest.MonkeyPatch, language: str | None,
 ) -> None:
@@ -367,7 +367,7 @@ def test_ingestion_preserves_provider_language(
         assert connection.execute(select(content.c.language)).scalar_one() == expected_language
     assert result["item"]["language"] == expected_language
     reused = find_reusable_transcript(engine=engine, video_id_or_url="https://youtu.be/dQw4w9WgXcQ", languages=("en",))
-    assert (reused is not None) is (language == "en-US")
+    assert (reused is not None) is (language in {"en-US", "en-Latn-US-fonipa"})
 
 
 def test_prefer_existing_false_refreshes_transcript(monkeypatch: pytest.MonkeyPatch) -> None:

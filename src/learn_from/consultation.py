@@ -62,6 +62,17 @@ class _Answer(BaseModel):
     limitations: str
 
 
+def _answer_schema(evidence: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Restrict generated citations to this request's actual source identifiers."""
+    schema = _Answer.model_json_schema()
+    allowed_ids = list(dict.fromkeys(source["evidence_id"] for source in evidence))
+    for definition in schema["$defs"].values():
+        citation_field = definition.get("properties", {}).get("evidence_ids")
+        if citation_field is not None:
+            citation_field["items"]["enum"] = list(allowed_ids)
+    return schema
+
+
 def _validate_scope(channel_ids: Sequence[str]) -> list[str]:
     scope = list(dict.fromkeys(channel_ids))
     if not scope or len(scope) > 10:
@@ -301,7 +312,7 @@ def consult_published_views(*, engine: Engine, question: str, channel_ids: Seque
         "service_tier": "default", "store": False,
         "truncation": "disabled",
         "max_output_tokens": max_output_tokens,
-        "text": {"format": {"type": "json_schema", "name": "published_views_consultation", "strict": True, "schema": _Answer.model_json_schema()}},
+        "text": {"format": {"type": "json_schema", "name": "published_views_consultation", "strict": True, "schema": _answer_schema(packet["evidence"])}},
     }
     input_token_upper_bound = len(json.dumps(payload, ensure_ascii=False).encode()) + 2048
     if input_token_upper_bound > 900000:
