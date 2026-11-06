@@ -1,0 +1,11 @@
+.git
+.env*
+.codex
+.idea
+.cache
+.venv
+output
+docs
+tests
+*.pdf
+**/__pycache__

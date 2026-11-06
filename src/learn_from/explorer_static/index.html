@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#17201d">
+  <title>Corpus Lens | Learn From</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#library" aria-label="Corpus Lens home">
+        <span class="brand-mark">CL</span>
+        <span><strong>Corpus Lens</strong><small>Learn From</small></span>
+      </a>
+      <nav class="nav" aria-label="Primary navigation">
+        <button class="nav-item active" data-view="library"><span class="nav-icon">▤</span><span>Workbench</span></button>
+        <button class="nav-item" data-view="atlas"><span class="nav-icon">⌘</span><span>Relationship atlas</span></button>
+        <button class="nav-item" data-view="quality"><span class="nav-icon">◫</span><span>Quality signals</span></button>
+        <button class="nav-item" data-view="pipeline"><span class="nav-icon">{ }</span><span>Pipeline & prompts</span></button>
+        <button class="nav-item" data-view="contexts"><span class="nav-icon">⎇</span><span>Profiles & context</span></button>
+      </nav>
+      <label class="version-control" for="global-version">
+        <span>Extraction version</span>
+        <select id="global-version">
+          <option value="2.0">V2</option>
+          <option value="1.0">V1</option>
+        </select>
+      </label>
+      <div class="sidebar-foot">
+        <span class="status-dot"></span>
+        <span><strong>Live corpus</strong><small>Versioned profile drafts</small></span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="mobile-menu" aria-label="Open navigation">☰</button>
+        <div class="global-search">
+          <span aria-hidden="true">⌕</span>
+          <input id="global-search" type="search" placeholder="Search documents, topics, entities, references…" autocomplete="off">
+          <kbd>/</kbd>
+        </div>
+        <div class="corpus-stat" id="corpus-stat">Loading corpus…</div>
+      </header>
+
+      <section class="view active" id="view-library">
+        <div class="library-layout">
+          <section class="document-rail" aria-label="Document library">
+            <div class="rail-head">
+              <div><span class="eyebrow">Library</span><strong id="document-count">Documents</strong></div>
+              <select id="document-sort" aria-label="Sort documents">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="views">Most viewed</option>
+                <option value="title">Title A–Z</option>
+              </select>
+            </div>
+            <div class="category-filter" id="category-filter"></div>
+            <div class="document-list" id="document-list"><div class="loading-block">Loading the library…</div></div>
+          </section>
+
+          <section class="transcript-pane" id="transcript-pane">
+            <div class="empty-state">
+              <span class="empty-kicker">Transcript workbench</span>
+              <h1>Choose a document to inspect its evidence.</h1>
+              <p>The transcript and every stored extraction will stay side by side.</p>
+            </div>
+          </section>
+
+          <aside class="inspector" id="inspector" aria-label="Extraction inspector">
+            <div class="inspector-empty">
+              <span class="inspector-glyph">✦</span>
+              <strong>Extraction inspector</strong>
+              <p>Select a document to see its category, topics, people, entities, and references.</p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-atlas">
+        <div class="page-head">
+          <div><span class="eyebrow">Relationship atlas</span><h1>Follow meaning across the corpus.</h1></div>
+          <p>Select any extracted concept to see every document it connects.</p>
+        </div>
+        <div class="atlas-controls">
+          <div class="segmented" id="atlas-kinds" aria-label="Relationship type">
+            <button data-kind="category">Categories</button>
+            <button data-kind="channel">Channels</button>
+            <button class="active" data-kind="entity">Entities</button>
+            <button data-kind="reference">References</button>
+            <button data-kind="topic">Topics</button>
+            <button data-kind="participant">Participants</button>
+            <button data-kind="keyword">Keywords</button>
+          </div>
+          <input id="atlas-search" type="search" placeholder="Filter this index…">
+        </div>
+        <div class="atlas-layout">
+          <div class="atlas-index" id="atlas-index"><div class="loading-block">Building the index…</div></div>
+          <div class="atlas-detail" id="atlas-detail">
+            <div class="empty-state compact"><span class="empty-kicker">Cross-document view</span><h2>Select an item from the index.</h2></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-quality">
+        <div class="page-head quality-head">
+          <div><span class="eyebrow">Quality signals</span><h1>See where the extraction holds up.</h1></div>
+          <p>Coverage is presence, not correctness. Use it to find the records worth reviewing first.</p>
+        </div>
+        <div class="coverage-grid" id="coverage-grid"></div>
+        <div class="quality-table-wrap">
+          <div class="table-head"><div><span class="eyebrow">Document coverage</span><strong>Lowest coverage first</strong></div><span id="quality-count"></span></div>
+          <div class="quality-table" id="quality-table"><div class="loading-block">Calculating coverage…</div></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-pipeline">
+        <div class="page-head pipeline-head">
+          <div><span class="eyebrow">Ingestion internals</span><h1>Pipeline & prompts</h1></div>
+          <p>Live extraction contract assembled by the production Python path.</p>
+        </div>
+        <div class="pipeline-layout">
+          <aside class="stage-rail" id="stage-rail"><div class="loading-block">Tracing ingestion…</div></aside>
+          <div class="pipeline-main" id="pipeline-main"><div class="loading-block">Assembling the live prompt…</div></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-contexts">
+        <div class="page-head context-head">
+          <div><span class="eyebrow">Extraction control plane</span><h1>Profiles & context</h1></div>
+          <p>Trace scoped instructions from the global baseline to the effective document context.</p>
+        </div>
+        <div class="context-tabs segmented" id="context-tabs" aria-label="Context data type">
+          <button class="active" data-context-mode="profiles">Profile hierarchy</button>
+          <button data-context-mode="aliases">Resolution memory <span id="alias-count">0</span></button>
+          <button data-context-mode="learning">Learning proposals <span id="learning-count">0</span></button>
+        </div>
+        <div class="context-layout" id="context-layout">
+          <aside class="context-index" id="context-index"><div class="loading-block">Loading profile scopes…</div></aside>
+          <div class="context-detail" id="context-detail"><div class="loading-block">Composing effective context…</div></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

@@ -66,3 +66,8 @@ dist/
 # Local database and other runtime files
 *.sqlite3
 *.db
+
+# Keep deployment credentials and private working artifacts out of source.
+.env*
+.codex/
+output/
