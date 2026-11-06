@@ -198,3 +198,33 @@ def test_index_summary_preserves_bounded_error_and_halt_information():
     assert len(result["error"]) == 1000
     assert result["halt_reason"] == "Provider rejected file."
     assert len(manifest["error"]) == 4000
+
+
+@pytest.mark.parametrize("selection", ["direct", "hosted"])
+def test_prepare_only_exports_complete_evidence_without_responses(monkeypatch, runtime, tmp_path, selection):
+    transcript = "Beginning of source. " + "Substantive discussion. " * 700 + "End of source."
+    monkeypatch.setattr(consultation, "_load_full_documents", lambda *args: [{
+        "media_id": VIDEO_A, "channel_id": CHANNEL, "channel_name": "Example channel",
+        "content_id": 1, "title": "A useful interview", "publish_date": "2026-11-01",
+        "full_text": transcript, "timestamped_segments": [],
+    }])
+    monkeypatch.setattr(consultation, "_request_response", lambda *args: pytest.fail("Prepare mode must never request a model response"))
+    if selection == "hosted":
+        monkeypatch.setattr(hosted_retrieval, "hosted_search", lambda **kwargs: {"data": [{"attributes": {"video_id": VIDEO_A}}]})
+        scope = ["--job-id", "job-test"]
+    else:
+        runtime[0].openai_api_key = None
+        monkeypatch.setattr(hosted_retrieval, "hosted_search", lambda **kwargs: pytest.fail("Direct preparation must not search"))
+        scope = ["--video", VIDEO_A]
+    target = tmp_path / "prepared" / "evidence.json"
+    args = parser().parse_args(["consult", "Challenge my service idea", "--channel", CHANNEL,
+                               *scope, "--prepare-only", "--output", str(target)])
+    assert operations.run_operation(args) == 0
+    result = json.loads(target.read_text())
+    assert result["status"] == "prepared"
+    assert result["model_request_made"] is False
+    assert result["usage"] is None and result["estimated_cost_usd"] == 0
+    assert result["coverage"]["complete_selected_documents"] is True
+    assert result["coverage"]["read_video_ids"] == [VIDEO_A]
+    assert result["evidence"][0]["text"] == transcript
+    assert result["evidence"][0]["url"] == f"https://www.youtube.com/watch?v={VIDEO_A}"

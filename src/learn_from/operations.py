@@ -67,6 +67,8 @@ def add_operation_parsers(subparsers: Any) -> None:
     scope.add_argument("--job-id")
     p.add_argument("--max-documents", type=_document_limit, default=3)
     p.add_argument("--max-cost-usd", type=_consultation_budget, default=0.10)
+    p.add_argument("--prepare-only", action="store_true",
+                   help="Export complete selected transcript evidence without a model request.")
     p.add_argument("--output")
     subparsers.add_parser("collection-worker", help="One-shot cloud worker configured with environment variables.")
 
@@ -143,7 +145,7 @@ def run_operation(args: argparse.Namespace) -> int:
             from learn_from.worker import run_worker
             return run_worker(settings=settings, engine=engine)
         elif args.command == "consult":
-            from learn_from.consultation import consult_published_views
+            from learn_from.consultation import consult_published_views, read_consultation_documents
             max_documents = _document_limit(args.max_documents)
             max_cost_usd = _consultation_budget(args.max_cost_usd)
             target = Path(args.output) if args.output else None
@@ -175,9 +177,15 @@ def run_operation(args: argparse.Namespace) -> int:
                 search_metadata = {"provider": "openai_vector_store", "vector_store_id": store_id,
                                    "matched_passages": len(search_result.get("data", [])), "selected_video_ids": video_ids}
             if video_ids:
-                result = consult_published_views(engine=engine, question=args.question,
-                    channel_ids=args.channels, video_ids=video_ids, openai_api_key=settings.openai_api_key,
-                    max_cost_usd=max_cost_usd, max_context_chars=300000)
+                if getattr(args, "prepare_only", False):
+                    packet = read_consultation_documents(engine=engine, question=args.question,
+                        channel_ids=args.channels, video_ids=video_ids, max_context_chars=300000)
+                    result = {"status": "prepared", **packet, "model_request_made": False,
+                              "usage": None, "estimated_cost_usd": 0.0}
+                else:
+                    result = consult_published_views(engine=engine, question=args.question,
+                        channel_ids=args.channels, video_ids=video_ids, openai_api_key=settings.openai_api_key,
+                        max_cost_usd=max_cost_usd, max_context_chars=300000)
             if search_metadata:
                 result["source_selection"] = search_metadata
             if target is not None:

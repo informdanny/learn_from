@@ -30,4 +30,6 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 learn-from --help
 ```
 
+The `consult --prepare-only` option exports complete selected source evidence for review without making a Responses API model call. Hosted search may still be used when sources are selected by a collection job.
+
 Tests use isolated fixtures and mocked external calls. No credentials are included. The standalone transcript skill, private planning notes, provider payloads, outputs, and historical migration tests are outside this runtime snapshot.

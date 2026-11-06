@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
+from urllib.error import HTTPError
 
 import pytest
 
@@ -174,3 +176,42 @@ def test_explicit_large_document_limit_still_reads_complete_text_with_budget(mon
     result = module.consult_published_views(engine=None, question="Read all", channel_ids=[CHANNEL_A], video_ids=[VIDEO_A], openai_api_key="test-only", max_context_chars=300000)
     assert result["coverage"]["selected_text_characters"] == len(source_text)
     assert 0.07 < result["reserved_cost_usd"] < 0.10
+
+
+@pytest.mark.parametrize("status,code,error_type,expected", [
+    (429, "credit_balance_exhausted", "insufficient_quota", "credits are exhausted (credit_balance_exhausted)"),
+    (429, None, "insufficient_quota", "quota or billing limit was reached (insufficient_quota)"),
+    (429, "rate_limit_exceeded", "tokens", "rate limit was reached (rate_limit_exceeded)"),
+    (429, None, "rate_limit_error", "rate limit was reached (rate_limit_exceeded)"),
+    (401, "invalid_api_key", "invalid_request_error", "authentication failed"),
+    (403, None, None, "access was denied"),
+    (429, "secret-provider-code", "secret-provider-type", "could not be safely classified"),
+])
+def test_http_error_classification_is_safe_and_never_retries(monkeypatch, status, code, error_type, expected):
+    calls = []
+    def fail(request, **kwargs):
+        calls.append(request)
+        body = {"error": {"code": code, "type": error_type, "message": "secret-key echoed with PRIVATE TRANSCRIPT", "param": "secret-param"}}
+        raise HTTPError("https://api.openai.com/v1/responses", status, "secret-status", {}, BytesIO(json.dumps(body).encode()))
+    monkeypatch.setattr(module, "urlopen", fail)
+    with pytest.raises(module.ConsultationError) as captured:
+        module._request_response({"input": "PRIVATE TRANSCRIPT"}, "secret-key", 10)
+    message = str(captured.value)
+    assert expected in message
+    assert f"HTTP {status}" in message
+    assert "No automatic retry" in message
+    assert "secret-" not in message and "PRIVATE TRANSCRIPT" not in message
+    assert len(calls) == 1
+
+
+def test_malformed_http_error_body_remains_private_and_bounded(monkeypatch):
+    class BoundedBody(BytesIO):
+        def read(self, size=-1):
+            assert 0 < size <= 16384
+            return super().read(size)
+    def fail(*args, **kwargs):
+        raise HTTPError("https://api.openai.com/v1/responses", 429, "secret-status", {}, BoundedBody(b"secret-body" * 5000))
+    monkeypatch.setattr(module, "urlopen", fail)
+    with pytest.raises(module.ConsultationError, match="could not be safely classified") as captured:
+        module._request_response({}, "secret-key", 10)
+    assert "secret-" not in str(captured.value)

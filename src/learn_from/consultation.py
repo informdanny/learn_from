@@ -205,14 +205,40 @@ def _validate_packet(packet: dict[str, Any], question: str, scope: list[str]) ->
     return {"question": question.strip(), "evidence": packet["evidence"], "coverage": packet["coverage"]}
 
 
+def _safe_http_error_message(error: HTTPError) -> str:
+    """Classify known provider reasons without exposing free-form response text."""
+    code = error_type = None
+    try:
+        body = json.loads(error.read(16_384).decode("utf-8"))
+        details = body.get("error") if isinstance(body, dict) else None
+        if isinstance(details, dict):
+            code = details.get("code")
+            error_type = details.get("type")
+    except Exception:
+        # A missing, oversized, or malformed error body must not obscure the status.
+        pass
+    if code == "credit_balance_exhausted":
+        reason = "OpenAI API credits are exhausted (credit_balance_exhausted)"
+    elif code == "insufficient_quota" or error_type == "insufficient_quota":
+        reason = "OpenAI API quota or billing limit was reached (insufficient_quota)"
+    elif code == "rate_limit_exceeded" or error_type == "rate_limit_error":
+        reason = "OpenAI API rate limit was reached (rate_limit_exceeded)"
+    elif error.code == 401 or code == "invalid_api_key" or error_type == "authentication_error":
+        reason = "OpenAI API authentication failed; check the configured key"
+    elif error.code == 403:
+        reason = "OpenAI API access was denied for the configured credentials"
+    else:
+        reason = "OpenAI request failed; the provider reason could not be safely classified"
+    return f"{reason}; HTTP {error.code}. No automatic retry was made."
+
+
 def _request_response(payload: dict[str, Any], api_key: str, timeout_seconds: float) -> dict[str, Any]:
     request = Request("https://api.openai.com/v1/responses", data=json.dumps(payload, ensure_ascii=False).encode(), method="POST", headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             result = json.loads(response.read().decode())
     except HTTPError as exc:
-        # Provider bodies may echo request data; expose only safe status.
-        raise ConsultationError(f"OpenAI returned HTTP {exc.code}; no automatic retry was made.") from None
+        raise ConsultationError(_safe_http_error_message(exc)) from None
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise ConsultationError(f"OpenAI response unavailable ({type(exc).__name__}); the request may have incurred cost and was not retried.") from None
     if not isinstance(result, dict):
