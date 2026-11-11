@@ -13,11 +13,12 @@ from sqlalchemy import bindparam, text
 
 from learn_from.config import get_settings
 from learn_from.db import create_db_engine
+from learn_from.metadata_operations import METADATA_COMMANDS, add_metadata_parsers, run_metadata_operation
 
 OPERATION_COMMANDS = {
     "collection-plan", "collection-create", "collection-run", "collection-status",
     "collection-index", "consult", "collection-worker",
-}
+} | METADATA_COMMANDS
 
 
 def _document_limit(value: Any) -> int:
@@ -41,6 +42,7 @@ def _consultation_budget(value: Any) -> float:
 
 
 def add_operation_parsers(subparsers: Any) -> None:
+    add_metadata_parsers(subparsers)
     p = subparsers.add_parser("collection-plan", help="Discover channel uploads; no transcript acquisition.")
     p.add_argument("channels", nargs="+")
     p.add_argument("--after", default="2005-01-01T00:00:00+00:00")
@@ -214,6 +216,8 @@ def _balanced_hosted_selection(*, engine: Any, api_key: str, vector_store_id: st
 
 
 def run_operation(args: argparse.Namespace) -> int:
+    if args.command in METADATA_COMMANDS:
+        return run_metadata_operation(args)
     settings = get_settings()
     engine = create_db_engine(settings)
     try:

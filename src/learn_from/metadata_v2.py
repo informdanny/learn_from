@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
+from decimal import Decimal
+from importlib.resources import files
 from typing import Any, Literal
+from urllib.error import HTTPError, URLError
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import MetaData, Table, and_, func, insert, or_, select, update
@@ -19,7 +23,6 @@ from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 from learn_from.metadata import (
     MetadataExtractionError,
     MetadataPersistenceError,
-    _extract_json_from_response_payload,
     _normalize_key,
     _post_json,
 )
@@ -37,6 +40,7 @@ V2_PROVIDER = "openai"
 _MODEL_TOKEN_PRICING = {
     "gpt-5.6-luna": {"input": 1.00, "cached_input": 0.10, "output": 6.00},
     "gpt-5.6-terra": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    "gpt-6-luna": {"input": 0.10, "cached_input": 0.01, "cache_write": 0.125, "output": 0.50},
 }
 _USAGE_COLLECTOR: ContextVar[list[dict[str, Any]] | None] = ContextVar(
     "metadata_v2_usage_collector",
@@ -453,6 +457,9 @@ def build_transcript_chunks(
             chunks.append(_chunk_from_segments(index, chunk_segments))
             index += 1
             overlap = chunk_segments[-overlap_segments:] if overlap_segments else []
+            # A large next segment must not cause an endless loop over overlap.
+            while overlap and sum(len(item["text"]) + 24 for item in overlap) + addition > max_chars:
+                overlap = overlap[1:]
             chunk_segments = list(overlap)
             chunk_chars = sum(len(item["text"]) + 24 for item in chunk_segments)
             continue
@@ -494,62 +501,36 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+def _v2_prompt_contract() -> dict[str, Any]:
+    return json.loads(files("learn_from").joinpath("prompts.json").read_text())["metadata_v2"]
+
+
 def build_extractor_instructions(*, profile: EffectiveProfile) -> str:
     coverage = profile.config.get("coverage", {})
     modules = profile.config.get("reference_modules", [])
-    custom_instructions = str(profile.config.get("prompt_instructions") or "").strip()
-    category_schema = profile.config.get("category_schema", [])
-    return "\n".join(
-        value
-        for value in (
-            "# Identity\nYou are Worker 1, the transcript metadata extractor for a retrieval library.",
-            "# Hard boundaries\n"
-            "Extract candidates from supplied evidence only. Preserve uncertainty and changes of position. "
-            "Do not perform external research, silently identify unnamed people, or use generic roles such as "
-            "speaker, host, guest, or narrator as participant names. Participants must speak or be present in "
-            "this document. A person mentioned as a guest in a previous episode is an entity mention, not a "
-            "participant in the current document. Scripture citations belong in references, not keywords.",
-            "# Coverage\n"
-            f"Topics={coverage.get('topics', 'top_n')}; keywords={coverage.get('keywords', 'top_n')}; "
-            f"participants={coverage.get('participants', 'exhaustive_named')}; "
-            f"entities={coverage.get('entities', 'high_signal')}; "
-            f"references={coverage.get('references', 'exhaustive')}.",
-            "# Reference modules\n"
-            f"Enabled modules: {', '.join(str(item) for item in modules) or 'none'}. "
-            "Emit one reference candidate per distinct work or passage; never combine multiple citations into one candidate. "
-            "When scripture is enabled, capture every explicit scripture mention and probable allusion, but mark "
-            "allusions as inferred and retain the exact transcript wording.",
-            "# Category attributes\n" + json.dumps(category_schema, sort_keys=True),
-            "# Profile instructions\n" + custom_instructions if custom_instructions else "",
-            "# Output\nReturn only the strict structured output requested by the response schema.",
-        )
-        if value
+    custom = str(profile.config.get("prompt_instructions") or "").strip()
+    contract = _v2_prompt_contract()
+    return str(contract["extractor_instructions"]).format(
+        topics=coverage.get("topics", "top_n"), keywords=coverage.get("keywords", "top_n"),
+        participants=coverage.get("participants", "exhaustive_named"),
+        entities=coverage.get("entities", "high_signal"), references=coverage.get("references", "exhaustive"),
+        modules=", ".join(str(item) for item in modules) or "none",
+        category_schema=json.dumps(profile.config.get("category_schema", []), sort_keys=True),
+        custom_instructions="\n# Profile instructions\n" + custom if custom else "",
+        index_instructions="\n" + str(contract["index_instructions"]) if profile.config.get("index_metadata_mode") else "",
     )
 
 
 def build_extractor_input(
-    *,
-    context: ContentContext,
-    profile: EffectiveProfile,
-    chunk: TranscriptChunk,
-    chunk_count: int,
+    *, context: ContentContext, profile: EffectiveProfile, chunk: TranscriptChunk, chunk_count: int,
 ) -> str:
-    known_values = profile.config.get("known_values", {})
-    blocked_values = profile.config.get("blocked_values", {})
-    return (
-        "<document_context>\n"
-        f"title: {context.title}\n"
-        f"source: {context.source_id}\n"
-        f"channel: {context.channel_name or 'ad hoc'}\n"
-        f"category: {context.category_name or 'unassigned'}\n"
-        f"description: {context.description or ''}\n"
-        f"known_values: {json.dumps(known_values, sort_keys=True)}\n"
-        f"blocked_values: {json.dumps(blocked_values, sort_keys=True)}\n"
-        "</document_context>\n"
-        f"<transcript_chunk index=\"{chunk.index}\" count=\"{chunk_count}\" "
-        f"start_seconds=\"{chunk.start_seconds}\" end_seconds=\"{chunk.end_seconds}\">\n"
-        f"{chunk.text}\n"
-        "</transcript_chunk>"
+    return str(_v2_prompt_contract()["extractor_input"]).format(
+        title=context.title, source=context.source_id, channel=context.channel_name or "ad hoc",
+        category=context.category_name or "unassigned", description=context.description or "",
+        known_values=json.dumps(profile.config.get("known_values", {}), sort_keys=True),
+        blocked_values=json.dumps(profile.config.get("blocked_values", {}), sort_keys=True),
+        index=chunk.index, chunk_count=chunk_count, start_seconds=chunk.start_seconds,
+        end_seconds=chunk.end_seconds, text=chunk.text,
     )
 
 
@@ -745,6 +726,9 @@ def _request_openai_structured(
     schema: Mapping[str, Any],
     timeout_seconds: float,
     service_tier: str,
+    max_output_tokens: int | None = None,
+    store: bool | None = None,
+    prompt_cache_ttl: str | None = None,
 ) -> Mapping[str, Any]:
     if not api_key:
         raise ValueError("OPENAI_API_KEY is required for Metadata V2.")
@@ -764,6 +748,17 @@ def _request_openai_structured(
     }
     if service_tier != "auto":
         payload["service_tier"] = service_tier
+    if max_output_tokens is not None:
+        if isinstance(max_output_tokens, bool) or not 256 <= max_output_tokens <= 6000:
+            raise ValueError("max_output_tokens must be between 256 and 6,000.")
+        payload["max_output_tokens"] = max_output_tokens
+    if store is not None:
+        payload["store"] = store
+        payload["truncation"] = "disabled"
+    if prompt_cache_ttl is not None:
+        if prompt_cache_ttl not in {"30m", "12h"}:
+            raise ValueError("Unsupported cache lifetime.")
+        payload["prompt_cache_options"] = {"ttl": prompt_cache_ttl}
 
     response = _post_json(
         url="https://api.openai.com/v1/responses",
@@ -780,11 +775,69 @@ def _request_openai_structured(
         response=response,
         model=model,
         requested_service_tier=service_tier,
+        requested_cache_ttl=prompt_cache_ttl,
     )
-    parsed = _extract_json_from_response_payload(response)
+    if response.get("status") in {"incomplete", "failed", "cancelled"}:
+        diagnostics = _safe_response_diagnostics(response)
+        raise MetadataExtractionError("OpenAI did not complete the structured metadata response "
+                                      f"({diagnostics['response_status']}; {diagnostics['incomplete_reason'] or 'reason not reported'}).")
+    try:
+        parsed = _parse_v2_response(response)
+    except MetadataExtractionError as exc:
+        collector = _USAGE_COLLECTOR.get()
+        if collector:
+            collector[-1]["parse_error_code"] = getattr(exc, "code", "invalid_structured_output")
+        raise
     if not isinstance(parsed, Mapping):
         raise MetadataExtractionError("OpenAI returned a non-object V2 extraction payload.")
     return dict(parsed)
+
+
+def _parse_v2_response(response: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read only assistant final output, never reasoning text or tool arguments."""
+    def fail(code: str) -> None:
+        error = MetadataExtractionError(f"OpenAI structured metadata could not be read ({code}).")
+        error.code = code
+        raise error
+
+    output = response.get("output")
+    if isinstance(output, list):
+        messages = [item for item in output if isinstance(item, Mapping)
+                    and item.get("type") == "message" and item.get("role") == "assistant"]
+        if any(block.get("type") == "refusal" for item in messages for block in item.get("content", [])
+               if isinstance(block, Mapping)):
+            fail("refusal")
+        final = [item for item in messages if item.get("phase") == "final_answer"]
+        messages = final or [item for item in messages if item.get("phase") != "commentary"]
+        if any(item.get("status") == "incomplete" for item in messages):
+            fail("incomplete_message")
+        text = "".join(block["text"] for item in messages for block in item.get("content", [])
+                       if isinstance(block, Mapping) and block.get("type") == "output_text" and isinstance(block.get("text"), str))
+    else:
+        # Preserve compatibility with already-parsed SDK responses and older mocks.
+        for key in ("output_parsed", "parsed_output", "parsed"):
+            if isinstance(response.get(key), Mapping):
+                return dict(response[key])
+        text = response.get("output_text")
+    if not isinstance(text, str) or not text.strip():
+        fail("missing_assistant_output")
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        fail("invalid_json")
+    if not isinstance(parsed, Mapping):
+        fail("non_object_json")
+    return dict(parsed)
+
+
+def _safe_response_diagnostics(response: Mapping[str, Any]) -> dict[str, Any]:
+    status = response.get("status")
+    details = response.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, Mapping) else None
+    return {
+        "response_status": status if status in {"completed", "incomplete", "failed", "cancelled", "in_progress", "queued"} else "not_reported",
+        "incomplete_reason": reason if reason in {"max_output_tokens", "content_filter"} else ("other" if reason else None),
+    }
 
 
 def _capture_response_usage(
@@ -792,12 +845,18 @@ def _capture_response_usage(
     response: Mapping[str, Any],
     model: str,
     requested_service_tier: str,
+    requested_cache_ttl: str | None = None,
 ) -> None:
     collector = _USAGE_COLLECTOR.get()
     if collector is None:
         return
     usage = response.get("usage")
     if not isinstance(usage, Mapping):
+        collector.append({"step": _USAGE_STEP.get(), "model": model,
+                          "service_tier": response.get("service_tier") or requested_service_tier,
+                          "input_tokens": None, "output_tokens": None, "total_tokens": None,
+                          "estimated_cost": None, "usage_status": "not_reported",
+                          **_safe_response_diagnostics(response)})
         return
     input_details = usage.get("input_tokens_details")
     output_details = usage.get("output_tokens_details")
@@ -806,16 +865,29 @@ def _capture_response_usage(
     input_tokens = int(usage.get("input_tokens") or 0)
     cached_input_tokens = int(input_details.get("cached_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
+    cache_options = response.get("prompt_cache_options")
+    cache_options = cache_options if isinstance(cache_options, Mapping) else {}
+    cache_ttl = cache_options.get("ttl") or requested_cache_ttl or ("30m" if model == "gpt-6-luna" else None)
     event = {
         "step": _USAGE_STEP.get(),
         "model": model,
         "service_tier": response.get("service_tier") or requested_service_tier,
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
+        "cache_write_tokens": int(input_details.get("cache_write_tokens") or input_details.get("cache_creation_tokens") or 0),
+        "cache_retention": str(response.get("prompt_cache_retention") or "default"),
+        "cache_ttl": cache_ttl,
+        "cache_ttl_source": "response" if cache_options.get("ttl") else ("request" if requested_cache_ttl else "documented_default"),
         "output_tokens": output_tokens,
         "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
         "total_tokens": int(usage.get("total_tokens") or input_tokens + output_tokens),
+        "usage_status": "recorded",
+        **_safe_response_diagnostics(response),
     }
+    write_details = input_details.get("cache_write_tokens_details")
+    if isinstance(write_details, Mapping):
+        event["cache_write_30m_tokens"] = write_details.get("ttl_30m_tokens")
+        event["cache_write_12h_tokens"] = write_details.get("ttl_12h_tokens")
     event["estimated_cost"] = _estimate_token_cost(event)
     collector.append(event)
 
@@ -824,14 +896,32 @@ def _estimate_token_cost(event: Mapping[str, Any]) -> float | None:
     rates = _MODEL_TOKEN_PRICING.get(str(event.get("model") or ""))
     if not rates:
         return None
+    if event.get("input_tokens") is None or event.get("output_tokens") is None:
+        return None
     input_tokens = int(event.get("input_tokens") or 0)
     cached_tokens = min(input_tokens, int(event.get("cached_input_tokens") or 0))
+    write_tokens = min(input_tokens - cached_tokens, max(0, int(event.get("cache_write_tokens") or 0)))
     output_tokens = int(event.get("output_tokens") or 0)
+    input_multiplier = 2 if str(event.get("model")) == "gpt-6-luna" and input_tokens > 272000 else 1
+    output_multiplier = 1.5 if input_multiplier == 2 else 1
+    write_cost = write_tokens * rates.get("cache_write", rates["input"])
+    if str(event.get("model")) == "gpt-6-luna" and write_tokens:
+        if "cache_write_30m_tokens" in event or "cache_write_12h_tokens" in event:
+            short, long = event.get("cache_write_30m_tokens"), event.get("cache_write_12h_tokens")
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (short, long)) or short + long != write_tokens:
+                return None
+            write_cost = short * 0.125 + long * 0.25
+        elif event.get("cache_ttl") in {"30m", "12h"}:
+            write_cost = write_tokens * (0.25 if event["cache_ttl"] == "12h" else 0.125)
+        else:
+            return None  # Retention policy (e.g.24h) does not identify billable TTL.
     cost = (
-        (input_tokens - cached_tokens) * rates["input"]
-        + cached_tokens * rates["cached_input"]
-        + output_tokens * rates["output"]
+        ((input_tokens - cached_tokens - write_tokens) * rates["input"]
+         + cached_tokens * rates["cached_input"] + write_cost) * input_multiplier
+        + output_tokens * rates["output"] * output_multiplier
     ) / 1_000_000
+    if str(event.get("model")) == "gpt-6-luna":
+        cost *= {"flex": 0.5, "batch": 0.5, "fast": 2, "priority": 2}.get(str(event.get("service_tier")), 1)
     return round(cost, 8)
 
 
@@ -883,6 +973,7 @@ def summarize_run_usage(
                 "expected_request_count": expected_requests,
                 "input_tokens": sum(int(event.get("input_tokens") or 0) for event in step_events) if step_events else None,
                 "cached_input_tokens": sum(int(event.get("cached_input_tokens") or 0) for event in step_events) if step_events else None,
+                "cache_write_tokens": sum(int(event.get("cache_write_tokens") or 0) for event in step_events) if step_events else None,
                 "output_tokens": sum(int(event.get("output_tokens") or 0) for event in step_events) if step_events else None,
                 "reasoning_tokens": sum(int(event.get("reasoning_tokens") or 0) for event in step_events) if step_events else None,
                 "total_tokens": sum(int(event.get("total_tokens") or 0) for event in step_events) if step_events else None,
@@ -911,15 +1002,42 @@ def summarize_run_usage(
     estimated_costs = [event.get("estimated_cost") for event in available_events]
     return {
         "tracking_status": "recorded" if available_events else "not_recorded",
-        "pricing_basis": "Published standard API token rates captured 2026-07-12; billed cost may differ by service tier.",
+        "pricing_basis": "GPT-6 Luna rates checked 2026-11-11: cache writes use reported 30m/12h token splits or billable TTL, independent of deprecated retention policy. Legacy model rates captured 2026-07-12. Estimate before credits/tax; not an invoice.",
         "total_tokens": sum(int(event.get("total_tokens") or 0) for event in available_events) if available_events else None,
         "input_tokens": sum(int(event.get("input_tokens") or 0) for event in available_events) if available_events else None,
         "cached_input_tokens": sum(int(event.get("cached_input_tokens") or 0) for event in available_events) if available_events else None,
+        "cache_write_tokens": sum(int(event.get("cache_write_tokens") or 0) for event in available_events) if available_events else None,
         "output_tokens": sum(int(event.get("output_tokens") or 0) for event in available_events) if available_events else None,
         "reasoning_tokens": sum(int(event.get("reasoning_tokens") or 0) for event in available_events) if available_events else None,
         "estimated_cost": round(sum(float(value) for value in estimated_costs if value is not None), 8) if available_events and all(value is not None for value in estimated_costs) else None,
         "steps": steps,
+        "events": [dict(event) for event in events],
     }
+
+
+def recalculate_metadata_usage(usage: Mapping[str, Any], *, assumed_cache_ttl: str | None = None) -> dict[str, Any]:
+    """Reprice saved receipts without provider calls or persistence.
+
+    Only pass an assumed TTL when the original request settings establish it.
+    The pilot omitted cache options, which documents a 30-minute default.
+    """
+    if assumed_cache_ttl not in {None, "30m", "12h"}:
+        raise ValueError("Unsupported assumed cache lifetime.")
+    result = json.loads(json.dumps(usage))
+    events = result.get("events") or []
+    for event in events:
+        if event.get("model") == "gpt-6-luna" and not event.get("cache_ttl") and assumed_cache_ttl:
+            event.update(cache_ttl=assumed_cache_ttl, cache_ttl_source="verified_original_request_setting")
+        event["estimated_cost"] = _estimate_token_cost(event)
+    costs = [event.get("estimated_cost") for event in events if event.get("total_tokens") is not None]
+    result["estimated_cost"] = round(sum(costs), 8) if costs and all(cost is not None for cost in costs) else None
+    for step in result.get("steps", []):
+        if step.get("kind") != "model":
+            continue
+        step_costs = [event.get("estimated_cost") for event in events if event.get("step") == step.get("step")]
+        step["estimated_cost"] = round(sum(step_costs), 8) if step_costs and all(cost is not None for cost in step_costs) else None
+    result["pricing_basis"] = "Recomputed from saved token receipts using published GPT-6 Luna 30m/12h write rates checked 2026-11-11. Billable TTL is separate from deprecated maximum retention. Estimates before credits/tax; unknown usage remains unknown."
+    return result
 
 
 def run_resolver_worker(
@@ -1001,42 +1119,20 @@ def run_resolver_worker(
 
 
 def build_resolver_instructions(*, profile: EffectiveProfile) -> str:
-    modules = profile.config.get("reference_modules", [])
-    return (
-        "# Identity\n"
-        "You are Worker 2, the canonical resolver and enrichment librarian.\n"
-        "# Goal\n"
-        "Resolve raw metadata candidates into canonical values while preserving the original evidence.\n"
-        "# Rules\n"
-        "Do not invent an identity for unnamed people. Generic roles are not names. Keep uncertain results "
-        "provisional or unresolved. Distinguish explicit, normalized, alias, inferred, and externally_verified "
-        "resolution bases. A model-knowledge inference is not externally verified.\n"
-        "# References\n"
-        f"Enabled specialized modules: {', '.join(str(item) for item in modules) or 'none'}. "
-        "For scripture, return structured passage coordinates when supported by the evidence. If a transcript "
-        "only alludes to a passage, retain inferred as the basis.\n"
-        "# Output\nReturn every supplied unresolved candidate exactly once in the strict response schema."
+    return str(_v2_prompt_contract()["resolver_instructions"]).format(
+        modules=", ".join(str(item) for item in profile.config.get("reference_modules", [])) or "none",
     )
 
 
 def build_resolver_input(
-    *,
-    context: ContentContext,
-    profile: EffectiveProfile,
-    unresolved: ResolverOutput,
+    *, context: ContentContext, profile: EffectiveProfile, unresolved: ResolverOutput,
     aliases: Mapping[str, Mapping[str, str]],
 ) -> str:
-    return (
-        "<document_context>\n"
-        f"title: {context.title}\n"
-        f"channel: {context.channel_name or 'ad hoc'}\n"
-        f"category: {context.category_name or 'unassigned'}\n"
-        f"approved_aliases: {json.dumps(aliases, sort_keys=True)}\n"
-        f"known_values: {json.dumps(profile.config.get('known_values', {}), sort_keys=True)}\n"
-        "</document_context>\n"
-        "<unresolved_candidates>\n"
-        f"{unresolved.model_dump_json()}\n"
-        "</unresolved_candidates>"
+    return str(_v2_prompt_contract()["resolver_input"]).format(
+        title=context.title, channel=context.channel_name or "ad hoc",
+        category=context.category_name or "unassigned", aliases=json.dumps(aliases, sort_keys=True),
+        known_values=json.dumps(profile.config.get("known_values", {}), sort_keys=True),
+        unresolved=unresolved.model_dump_json(),
     )
 
 
@@ -1628,18 +1724,8 @@ def run_learner_worker(
 
 
 def build_learner_instructions() -> str:
-    """Return the exact Worker 3 instruction block used at runtime."""
-    return (
-        "# Identity\nYou are Worker 3, the channel learner and evaluator.\n"
-        "# Goal\nFind repeatable channel knowledge that can reduce future extraction cost without converting "
-        "repeated errors into truth.\n"
-        "# Memory\nUse only the supplied versioned run history. Treat one extraction as an observation, not a fact.\n"
-        "# Rules\nPropose alias or value learning only when supported by authoritative channel identity or at "
-        "least three distinct documents without contradiction. Generic participant roles should be blocked. "
-        "Prompt and schema improvements are proposals only and must never be activated by this worker.\n"
-        "# Safety\nDo not alter document metadata, publish profiles, or infer unnamed identities.\n"
-        "# Output\nReturn only the strict learning-suggestion schema."
-    )
+    """Return the centralized Worker 3 instruction block used at runtime."""
+    return str(_v2_prompt_contract()["learner_instructions"])
 
 
 def get_metadata_v2_prompt_inspection() -> dict[str, Any]:
@@ -1775,6 +1861,263 @@ def preview_profile_instruction_contracts(config: Mapping[str, Any] | Any) -> di
     }
 
 
+INDEX_METADATA_VERSION = "index-1"
+INDEX_METADATA_MODEL = "gpt-6-luna"
+
+
+def _metadata_identity(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _index_call_reservation(kwargs: Mapping[str, Any], max_output_tokens: int) -> Decimal:
+    # UTF-8 bytes conservatively bound input tokens; include schema and framing.
+    token_bound = len(json.dumps({key: value for key, value in kwargs.items() if key != "api_key"}, ensure_ascii=False).encode()) + 2048
+    if token_bound > 900_000:
+        raise MetadataV2Error("Metadata input exceeds the supported context bound.")
+    # Reserve the highest published Luna cache-write rate, even for new input.
+    input_rate = Decimal("0.25") * (2 if token_bound > 272_000 else 1)
+    output_rate = Decimal("0.75") if token_bound > 272_000 else Decimal("0.50")
+    return (token_bound * input_rate + max_output_tokens * output_rate) / 1_000_000
+
+
+def _index_run_checkpoint(*, engine: Engine, run_id: int, manifest: Mapping[str, Any]) -> None:
+    with engine.begin() as connection:
+        table = _reflect_v2_tables(connection, names=("extraction_runs",))["extraction_runs"]
+        connection.execute(update(table).where(table.c.run_id == run_id).values(manifest=dict(manifest)))
+
+
+def _safe_metadata_failure(error: BaseException) -> dict[str, Any]:
+    """Classify a bounded cause chain without copying response bodies or messages."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    fallback: dict[str, Any] = {"kind": "unclassified", "http_status": None}
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current, HTTPError):
+            return {"kind": "http_error", "http_status": int(current.code)}
+        if isinstance(current, TimeoutError):
+            return {"kind": "timeout", "http_status": None}
+        if isinstance(current, URLError):
+            fallback = {"kind": "timeout" if isinstance(current.reason, TimeoutError) else "network_error", "http_status": None}
+        elif isinstance(current, json.JSONDecodeError):
+            fallback = {"kind": "invalid_provider_json", "http_status": None}
+        elif isinstance(current, ValidationError):
+            fallback = {"kind": "schema_validation", "http_status": None}
+        elif isinstance(current, MetadataExtractionError):
+            code = getattr(current, "code", None)
+            fallback = {"kind": "provider_response_error", "http_status": None}
+            if code in {"refusal", "incomplete_message", "missing_assistant_output", "invalid_json", "non_object_json"}:
+                fallback.update(kind="parse_error", parse_error_code=code)
+        current = current.__cause__ or current.__context__
+    return fallback
+
+
+def run_index_metadata_for_content(
+    *, engine: Engine, content_id: int, openai_api_key: str, max_cost_usd: float = 0.10,
+    force: bool = False, requester: StructuredRequester | None = None,
+    catalog: Mapping[str, Any] | None = None, max_output_tokens: int = 5000,
+    timeout_seconds: float = 90.0,
+) -> dict[str, Any]:
+    """Opt-in, cached full-transcript metadata with no model resolver or learner.
+
+    Limits are conservative estimates, not a provider billing cap. Failed or
+    uncertain attempts with the same identity require explicit ``force=True``.
+    No media category, active profile, or accepted vocabulary is changed here.
+    """
+    from learn_from.collections import _collection_lock
+    from learn_from.metadata_catalog import (
+        build_category_schema, get_metadata_schema, normalize_category_attributes,
+        persist_metadata_candidates, project_openai_metadata,
+    )
+
+    if isinstance(content_id, bool) or not isinstance(content_id, int) or content_id < 1:
+        raise ValueError("content_id must be a positive integer.")
+    if isinstance(max_cost_usd, bool):
+        raise ValueError("max_cost_usd must be positive and at most $1.")
+    try:
+        budget = Decimal(str(max_cost_usd))
+    except Exception:
+        raise ValueError("max_cost_usd must be positive and at most $1.") from None
+    if not budget.is_finite() or not 0 < budget <= 1:
+        raise ValueError("max_cost_usd must be positive and at most $1.")
+    if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or not 256 <= max_output_tokens <= 6000:
+        raise ValueError("max_output_tokens must be between 256 and 6,000.")
+    if not isinstance(timeout_seconds, (int, float)) or not 1 <= timeout_seconds <= 300:
+        raise ValueError("timeout_seconds must be between 1 and 300.")
+
+    with _collection_lock(engine, f"index-metadata:{content_id}") as check_lock:
+        context = load_content_context(engine=engine, content_id=content_id)
+        profile = load_effective_profile(engine=engine, context=context)
+        source_hash = hashlib.sha256(context.transcript_text.strip().encode()).hexdigest()
+        category_id = (profile.config.get("metadata_catalog") or {}).get("category_id", context.category_id)
+        selected_catalog = dict(catalog) if catalog is not None else get_metadata_schema(
+            engine=engine, channel_id=context.channel_id, category_id=category_id,
+            source_id=context.source_id, values_limit=1000,
+        )
+        fields = selected_catalog.get("fields") or []
+        if any(field.get("known_has_more") or field.get("value_offset", 0) for field in fields):
+            raise MetadataV2Error("Metadata catalog is incomplete; load all accepted values before extracting.")
+        if not fields:
+            raise MetadataV2Error("No active metadata catalog fields are configured for this source.")
+        config = json.loads(json.dumps(profile.config))
+        config["category_schema"] = build_category_schema(selected_catalog)
+        config["index_metadata_mode"] = True
+        config["known_values"] = {**config.get("known_values", {}), **{
+            field["key"]: [item["value"] for item in field.get("known_values", [])]
+            for field in fields
+        }}
+        profile = replace(profile, config=config, learning_mode="manual")
+        aliases = load_value_aliases(engine=engine, context=context)
+        # Segment text is usable only if it covers the complete authoritative text.
+        segments = context.timestamped_segments
+        segment_text = " ".join(str(item.get("text") or "") for item in segments)
+        aligned = " ".join(segment_text.split()) == " ".join(context.transcript_text.split())
+        oversized_segment = any(len(str(item.get("text") or "")) > DEFAULT_CHUNK_MAX_CHARS - 24 for item in segments)
+        starts = [_optional_float(item.get("start_seconds")) for item in segments]
+        durations = [_optional_float(item.get("duration_seconds")) for item in segments]
+        valid_timing = all(value is not None and math.isfinite(value) and value >= 0 for value in starts)
+        valid_timing = valid_timing and all(value is None or math.isfinite(value) and value >= 0 for value in durations)
+        valid_timing = valid_timing and starts == sorted(starts)
+        if not aligned or oversized_segment or not valid_timing:
+            context = replace(context, timestamped_segments=[])
+        route = ModelRoute("stable", INDEX_METADATA_MODEL, "none", INDEX_METADATA_MODEL, INDEX_METADATA_MODEL)
+        manifest = build_release_manifest(profile=profile, route=route, resolver_model_enabled=False, learner_model_enabled=False)
+        analysis_text, segment_map, chunks = build_transcript_chunks(
+            transcript_text=context.transcript_text, timestamped_segments=context.timestamped_segments,
+        )
+        if not chunks:
+            raise MetadataV2Error("Transcript normalization produced no extraction chunks.")
+        schema = _strict_schema(ChunkExtraction)
+        identity = {
+            "version": INDEX_METADATA_VERSION, "source_hash": source_hash,
+            "catalog_version": selected_catalog.get("version"),
+            "profile_hash": _metadata_identity({"config": config, "versions": profile.version_ids}),
+            "prompt_hash": _metadata_identity(_v2_prompt_contract()), "schema_hash": _metadata_identity(schema),
+            "aliases_hash": _metadata_identity(aliases), "model": INDEX_METADATA_MODEL,
+            "reasoning": "none", "max_output_tokens": max_output_tokens,
+            "context_hash": _metadata_identity({"title": context.title, "description": context.description,
+                "channel_id": context.channel_id, "channel_name": context.channel_name,
+                "category_name": context.category_name, "source_id": context.source_id,
+                "segments": context.timestamped_segments}),
+        }
+        cache_key = _metadata_identity(identity)
+        with engine.connect() as connection:
+            runs = _reflect_v2_tables(connection, names=("extraction_runs",))["extraction_runs"]
+            previous = connection.execute(select(runs).where(
+                runs.c.content_id == content_id,
+                runs.c.manifest["index_metadata"]["cache_key"].as_string() == cache_key,
+            ).order_by(runs.c.run_id.desc())).mappings().first()
+        if previous is not None and not force:
+            if previous["status"] != "completed":
+                raise MetadataV2Error(f"Metadata run {previous['run_id']} has an incomplete or failed attempt; no model request made. Inspect it before using force=True.")
+            resolution = dict(previous.get("resolved_output") or {})
+            normalized = resolution.get("attribute_resolution", {})
+            persist_metadata_candidates(engine=engine, run_id=previous["run_id"], results=normalized,
+                                        profile_id=profile.profile_ids[-1] if profile.profile_ids else None)
+            return {
+                "run_id": previous["run_id"], "status": "completed", "reused": True,
+                "content_id": content_id, "media_id": context.media_id,
+                "index_metadata": resolution.get("index_metadata", {}),
+                "field_results": resolution.get("index_metadata", {}).get("fields", []),
+                "usage": {"tracking_status": "cache_reused", "estimated_cost": 0.0, "total_tokens": 0,
+                          "input_tokens": 0, "output_tokens": 0, "requests_started": 0, "unreported_requests": 0},
+                "original_usage": (previous.get("manifest") or {}).get("usage"),
+            }
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required for index metadata extraction.")
+        instructions = build_extractor_instructions(profile=profile)
+        prepared = [dict(
+            api_key=openai_api_key, model=INDEX_METADATA_MODEL, reasoning_effort="none",
+            instructions=instructions, input_text=build_extractor_input(context=context, profile=profile, chunk=chunk, chunk_count=len(chunks)),
+            schema_name="metadata_v2_chunk", schema=schema, timeout_seconds=timeout_seconds,
+            service_tier="default", max_output_tokens=max_output_tokens, store=False,
+            prompt_cache_ttl="30m",
+        ) for chunk in chunks]
+        reservations = [_index_call_reservation(item, max_output_tokens) for item in prepared]
+        planned = sum(reservations, Decimal(0))
+        if planned > budget:
+            raise MetadataV2Error(f"Conservative complete-run estimate ${planned:.6f} exceeds the ${budget:.6f} budget; no model requests made.")
+        manifest["index_metadata"] = {**identity, "cache_key": cache_key,
+            "coverage": {"mode": "complete_transcript", "input_characters": len(context.transcript_text),
+                         "chunk_count": len(chunks), "timing_available": bool(segment_map)},
+            "budget": {"max_cost_usd": float(budget), "planned_cost_usd": float(planned),
+                       "reserved_cost_usd": 0.0, "requests_started": 0}}
+        run_id = _create_run(engine=engine, context=context, profile=profile, route=route, manifest=manifest)
+        events: list[dict[str, Any]] = []
+        collector_token = _USAGE_COLLECTOR.set(events)
+        step_token = _USAGE_STEP.set("extractor")
+        started = time.perf_counter()
+        requests_started = 0
+        reserved = Decimal(0)
+
+        def usage_summary() -> dict[str, Any]:
+            summary = summarize_run_usage(events=events, manifest=manifest, chunk_count=len(chunks),
+                                          durations={"extractor": time.perf_counter() - started})
+            summary.update(requests_started=requests_started,
+                           unreported_requests=max(0, requests_started - sum(event.get("total_tokens") is not None for event in events)), reserved_cost_usd=float(reserved))
+            return summary
+
+        try:
+            results: list[ChunkExtraction] = []
+            for parameters, reserve in zip(prepared, reservations, strict=True):
+                check_lock()
+                requests_started += 1
+                reserved += reserve
+                manifest["index_metadata"]["budget"].update(requests_started=requests_started, reserved_cost_usd=float(reserved))
+                manifest["usage"] = usage_summary()
+                # Durable reservation precedes the provider call; interruptions cannot appear free.
+                _index_run_checkpoint(engine=engine, run_id=run_id, manifest=manifest)
+                raw = (requester or _request_openai_structured)(**parameters)
+                results.append(ChunkExtraction.model_validate(raw))
+                manifest["usage"] = usage_summary()
+                _index_run_checkpoint(engine=engine, run_id=run_id, manifest=manifest)
+            extraction = _aggregate_chunk_extractions(results)
+            if "scripture" in config.get("reference_modules", []):
+                extraction["references"] = _merge_deterministic_scripture_references(
+                    references=extraction["references"], transcript_text=context.transcript_text)
+            resolution = run_resolver_worker(context=context, profile=profile, route=route, extraction=extraction,
+                aliases=aliases, openai_api_key=openai_api_key, use_model=False)
+            normalized = normalize_category_attributes(attributes=extraction["category_attributes"],
+                catalog=selected_catalog, transcript_text=context.transcript_text)
+            index_metadata = {"version": INDEX_METADATA_VERSION, "source_hash": source_hash,
+                "catalog_version": normalized.get("catalog_version", selected_catalog.get("version")),
+                "fields": normalized.get("fields", []), "rejected": normalized.get("rejected", []),
+                "openai_attributes": project_openai_metadata(normalized)}
+            for field in index_metadata["fields"]:
+                start, end = _find_index_evidence_time(field.get("evidence"), context.timestamped_segments)
+                field.update(start_seconds=start, end_seconds=end)
+            resolution.update(attribute_resolution=normalized, index_metadata=index_metadata)
+            manifest["usage"] = usage_summary()
+            _persist_completed_run(engine=engine, run_id=run_id, context=context, profile=profile,
+                extraction=extraction, resolution=resolution, learning={}, manifest=manifest,
+                analysis_text=analysis_text, segment_map=segment_map, chunk_count=len(chunks), allow_learning_updates=False)
+        except Exception as exc:
+            manifest["usage"] = usage_summary()
+            failure = _safe_metadata_failure(exc)
+            manifest["index_metadata"]["failure"] = failure
+            # Provider error bodies and validation payloads may contain transcript text or secrets.
+            detail = f"HTTP {failure['http_status']}" if failure.get("http_status") else failure["kind"]
+            safe_error = f"Index metadata run {run_id} failed ({detail}); recorded usage and reservations retained. No automatic retry was made."
+            _mark_run_failed(engine=engine, run_id=run_id, error=safe_error, manifest=manifest)
+            error = MetadataV2Error(safe_error)
+            error.run_id = run_id
+            error.usage = manifest["usage"]
+            error.failure = failure
+            raise error from None
+        finally:
+            _USAGE_STEP.reset(step_token)
+            _USAGE_COLLECTOR.reset(collector_token)
+        # Idempotent catalog writes can be repaired on a cache hit without model spending.
+        persist_metadata_candidates(engine=engine, run_id=run_id, results=normalized,
+                                    profile_id=profile.profile_ids[-1] if profile.profile_ids else None)
+        return {"run_id": run_id, "status": "completed", "reused": False,
+            "content_id": content_id, "media_id": context.media_id,
+            "index_metadata": index_metadata, "field_results": index_metadata["fields"],
+            "usage": manifest["usage"], "chunk_count": len(chunks)}
+
+
 def run_metadata_v2_for_content(
     *,
     engine: Engine,
@@ -1816,7 +2159,9 @@ def run_metadata_v2_for_content(
 
     usage_events: list[dict[str, Any]] = []
     durations: dict[str, float] = {}
+    chunks: list[TranscriptChunk] = []
     collector_token = _USAGE_COLLECTOR.set(usage_events)
+    initial_step_token = _USAGE_STEP.set("unknown")
     try:
         step_token = _USAGE_STEP.set("extractor")
         started = time.perf_counter()
@@ -1891,9 +2236,13 @@ def run_metadata_v2_for_content(
             )
     except Exception as exc:
         if persist_run and run_id is not None:
-            _mark_run_failed(engine=engine, run_id=run_id, error=str(exc))
+            failure_manifest = {**manifest, "usage": summarize_run_usage(
+                events=usage_events, manifest=manifest, chunk_count=len(chunks), durations=durations,
+            )}
+            _mark_run_failed(engine=engine, run_id=run_id, error=str(exc), manifest=failure_manifest)
         raise
     finally:
+        _USAGE_STEP.reset(initial_step_token)
         _USAGE_COLLECTOR.reset(collector_token)
 
     return {
@@ -2001,6 +2350,7 @@ def _persist_completed_run(
     analysis_text: str,
     segment_map: Sequence[Mapping[str, Any]],
     chunk_count: int,
+    allow_learning_updates: bool = True,
 ) -> None:
     names = (
         "extraction_runs",
@@ -2012,6 +2362,8 @@ def _persist_completed_run(
         "extraction_profiles",
         "extraction_profile_versions",
     )
+    if not allow_learning_updates:
+        names = names[:4]
     with engine.begin() as connection:
         tables = _reflect_v2_tables(connection, names=names)
         connection.execute(
@@ -2043,32 +2395,28 @@ def _persist_completed_run(
             extraction=extraction,
             resolution=resolution,
         )
-        _persist_learning_output(
-            connection=connection,
-            tables=tables,
-            run_id=run_id,
-            context=context,
-            profile=profile,
-            learning=learning,
-        )
-        _apply_corroborated_aliases(
-            connection=connection,
-            tables=tables,
-            run_id=run_id,
-            context=context,
-            profile=profile,
-            resolution=resolution,
-        )
+        if allow_learning_updates:
+            _persist_learning_output(
+                connection=connection, tables=tables, run_id=run_id,
+                context=context, profile=profile, learning=learning,
+            )
+            _apply_corroborated_aliases(
+                connection=connection, tables=tables, run_id=run_id,
+                context=context, profile=profile, resolution=resolution,
+            )
 
 
-def _mark_run_failed(*, engine: Engine, run_id: int, error: str) -> None:
+def _mark_run_failed(*, engine: Engine, run_id: int, error: str, manifest: Mapping[str, Any] | None = None) -> None:
     try:
         with engine.begin() as connection:
             table = _reflect_v2_tables(connection, names=("extraction_runs",))["extraction_runs"]
+            values: dict[str, Any] = {"status": "failed", "error": error[:4000], "completed_at": func.current_timestamp()}
+            if manifest is not None:
+                values["manifest"] = dict(manifest)
             connection.execute(
                 update(table)
                 .where(table.c.run_id == run_id)
-                .values(status="failed", error=error[:4000], completed_at=func.current_timestamp())
+                .values(**values)
             )
     except (SQLAlchemyError, MetadataV2Error):
         return
@@ -2429,6 +2777,45 @@ def _ensure_channel_profile_draft(
             config=config,
         )
     )
+
+
+def _find_index_evidence_time(
+    evidence: str | None, segments: Sequence[Mapping[str, Any]],
+) -> tuple[float | None, float | None]:
+    """Locate an entire unique quote, including passages across segment boundaries.
+
+    A short segment occurring somewhere in a quote cannot identify its location.
+    Ambiguous repeated quotes deliberately have no timestamp.
+    """
+    quote = " ".join(evidence.split()) if isinstance(evidence, str) else ""
+    if not quote:
+        return None, None
+    parts: list[str] = []
+    spans: list[tuple[int, int, Mapping[str, Any]]] = []
+    cursor = 0
+    for segment in segments:
+        part = " ".join(str(segment.get("text") or "").split())
+        if not part:
+            continue
+        if parts:
+            cursor += 1
+        start = cursor
+        parts.append(part)
+        cursor += len(part)
+        spans.append((start, cursor, segment))
+    full = " ".join(parts)
+    position = full.find(quote)
+    if position < 0 or full.find(quote, position + 1) >= 0:
+        return None, None
+    end_position = position + len(quote)
+    matched = [segment for start, end, segment in spans if start < end_position and end > position]
+    if not matched:
+        return None, None
+    start = _optional_float(matched[0].get("start_seconds"))
+    last_start = _optional_float(matched[-1].get("start_seconds"))
+    duration = _optional_float(matched[-1].get("duration_seconds"))
+    end = last_start + duration if last_start is not None and duration is not None else last_start
+    return start, end
 
 
 def _find_evidence_time(

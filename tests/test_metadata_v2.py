@@ -513,3 +513,114 @@ def test_run_usage_summary_rolls_worker_tokens_and_costs_up() -> None:
         "learner",
         "persistence",
     ]
+
+
+def test_luna_cost_separates_cached_reads_writes_and_uncached_input() -> None:
+    from learn_from.metadata_v2 import _estimate_token_cost
+
+    event = {"model": "gpt-6-luna", "input_tokens": 1000, "cached_input_tokens": 100,
+             "cache_write_tokens": 700, "output_tokens": 100, "service_tier": "default", "cache_ttl": "30m"}
+    assert _estimate_token_cost(event) == pytest.approx(0.0001585)
+    assert _estimate_token_cost({**event, "service_tier": "flex"}) == pytest.approx(0.00007925)
+    assert _estimate_token_cost({**event, "cache_ttl": "12h"}) == pytest.approx(0.000246)
+    assert _estimate_token_cost({"model": "gpt-6-luna", "input_tokens": 300000,
+                                 "cache_write_tokens": 300000, "output_tokens": 1000, "cache_ttl": "30m"}) == pytest.approx(0.07575)
+
+
+def test_segment_overlap_releases_space_for_a_large_following_segment() -> None:
+    segments = [{"text": "a " * 300, "start_seconds": 0, "duration_seconds": 1},
+                {"text": "b " * 300, "start_seconds": 1, "duration_seconds": 1}]
+    text, _, chunks = build_transcript_chunks(transcript_text="", timestamped_segments=segments,
+                                              max_chars=1000, overlap_segments=3)
+    assert len(chunks) == 2
+    assert "a " in chunks[0].text and "b " in chunks[-1].text
+    assert text.count('a') == 300 and text.count('b') == 300
+
+
+def test_cache_write_ttl_split_overrides_deprecated_retention_and_unknown_ttl_is_not_priced() -> None:
+    from learn_from.metadata_v2 import _estimate_token_cost
+
+    event = {'model': 'gpt-6-luna', 'input_tokens': 12000, 'cached_input_tokens': 4000,
+             'cache_write_tokens': 7000, 'cache_write_30m_tokens': 3000,
+             'cache_write_12h_tokens': 4000, 'output_tokens': 100, 'cache_retention': '24h'}
+    assert _estimate_token_cost(event) == pytest.approx(0.001565)
+    unknown = {key: value for key, value in event.items() if key not in {'cache_write_30m_tokens', 'cache_write_12h_tokens'}}
+    assert _estimate_token_cost(unknown) is None
+    assert _estimate_token_cost({**unknown, 'cache_ttl': 'unknown'}) is None
+    assert _estimate_token_cost({**unknown, 'cache_ttl': '30m'}) == pytest.approx(0.001065)
+    assert _estimate_token_cost({**event, 'cache_write_12h_tokens': 3999}) is None
+
+
+def test_usage_capture_records_split_lifetimes_and_allowlisted_failure_diagnostics() -> None:
+    from learn_from.metadata_v2 import _USAGE_COLLECTOR, _capture_response_usage
+
+    events = []
+    token = _USAGE_COLLECTOR.set(events)
+    try:
+        _capture_response_usage(response={'status': 'incomplete', 'incomplete_details': {'reason': 'max_output_tokens'},
+            'prompt_cache_retention': '24h', 'prompt_cache_options': {'ttl': '12h'},
+            'usage': {'input_tokens': 12000, 'output_tokens': 100,
+                'input_tokens_details': {'cached_tokens': 4000, 'cache_write_tokens': 7000,
+                    'cache_write_tokens_details': {'ttl_30m_tokens': 3000, 'ttl_12h_tokens': 4000}}}},
+            model='gpt-6-luna', requested_service_tier='default', requested_cache_ttl='30m')
+        _capture_response_usage(response={'status': 'incomplete', 'incomplete_details': {'reason': 'secret-body-value'}},
+            model='gpt-6-luna', requested_service_tier='default')
+    finally:
+        _USAGE_COLLECTOR.reset(token)
+    assert events[0]['cache_ttl'] == '12h'
+    assert events[0]['estimated_cost'] == pytest.approx(0.001565)
+    assert events[0]['incomplete_reason'] == 'max_output_tokens'
+    assert events[1]['incomplete_reason'] == 'other'
+    assert events[1]['estimated_cost'] is None and events[1]['total_tokens'] is None
+    assert 'secret-body-value' not in str(events)
+
+
+def test_saved_receipts_can_be_repriced_without_changing_original_or_guessing_ttl() -> None:
+    from learn_from.metadata_v2 import recalculate_metadata_usage
+
+    usage = {'events': [{'model': 'gpt-6-luna', 'step': 'extractor', 'input_tokens': 7335,
+        'cache_write_tokens': 7332, 'cached_input_tokens': 0, 'output_tokens': 1145,
+        'total_tokens': 8480, 'cache_retention': '24h', 'estimated_cost': 0.0014893}],
+        'steps': [{'step': 'extractor', 'kind': 'model', 'estimated_cost': 0.0014893}],
+        'estimated_cost': 0.0014893, 'unreported_requests': 1}
+    assert recalculate_metadata_usage(usage)['estimated_cost'] is None
+    updated = recalculate_metadata_usage(usage, assumed_cache_ttl='30m')
+    assert updated['estimated_cost'] == usage['estimated_cost']
+    assert updated['steps'][0]['estimated_cost'] == usage['estimated_cost']
+    assert updated['unreported_requests'] == 1
+    assert 'cache_ttl' not in usage['events'][0]
+
+
+def test_responses_parser_ignores_reasoning_tool_arguments_and_commentary() -> None:
+    from learn_from.metadata_v2 import _parse_v2_response
+
+    response = {'output': [
+        {'type': 'reasoning', 'content': [{'type': 'reasoning_text', 'text': 'not JSON'}]},
+        {'type': 'function_call', 'arguments': '{"wrong":true}'},
+        {'type': 'message', 'role': 'assistant', 'phase': 'commentary', 'content': [{'type': 'output_text', 'text': '{"wrong":true}\nExplanation after JSON.'}]},
+        {'type': 'message', 'role': 'assistant', 'phase': 'final_answer', 'status': 'completed',
+         'content': [{'type': 'output_text', 'text': '{"right":'}, {'type': 'output_text', 'text': 'true}'}]},
+    ]}
+    assert _parse_v2_response(response) == {'right': True}
+    with pytest.raises(Exception, match='missing_assistant_output'):
+        _parse_v2_response({'output': [response['output'][2]]})
+    with pytest.raises(Exception, match='missing_assistant_output'):
+        _parse_v2_response({'output': response['output'][:2]})
+    with pytest.raises(Exception, match='refusal'):
+        _parse_v2_response({'output': [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'refusal', 'refusal': 'private details'}]}]})
+    with pytest.raises(Exception, match='invalid_json') as raised:
+        _parse_v2_response({'output_text': 'private source text'})
+    assert 'private source text' not in str(raised.value)
+
+
+def test_index_timestamp_matches_full_quote_across_segments_and_rejects_ambiguity() -> None:
+    from learn_from.metadata_v2 import _find_index_evidence_time
+
+    segments = [
+        {'text': 'Yeah.', 'start_seconds': 2, 'duration_seconds': 1},
+        {'text': 'A great ecosystem to sell', 'start_seconds': 50, 'duration_seconds': 3},
+        {'text': 'and be paid for the work. Yeah.', 'start_seconds': 53, 'duration_seconds': 4},
+    ]
+    assert _find_index_evidence_time('A great ecosystem to sell and be paid for the work. Yeah.', segments) == (50, 57)
+    assert _find_index_evidence_time('Yeah.', segments) == (None, None)
+    assert _find_index_evidence_time('not in transcript', segments) == (None, None)

@@ -415,8 +415,34 @@ def sync_collection_index(*, engine: Engine, job_id: str, api_key: str,
         return copy.deepcopy(manifest)
 
 
+METADATA_FILTER_KEYS = frozenset({"industry", "business_model", "business_stage", "decision_area"})
+
+
+def _metadata_filters(values: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    from .metadata_catalog import BUSINESS_FIELDS
+
+    if values is None:
+        return []
+    if not isinstance(values, Mapping) or len(values) > len(METADATA_FILTER_KEYS):
+        raise ValueError("Metadata filters must be a small field/value mapping.")
+    filters = []
+    for key, value in values.items():
+        if (key not in METADATA_FILTER_KEYS or not isinstance(value, str)
+                or not 0 < len(value) <= 512 or value != value.casefold()
+                or not re.fullmatch(r"\w+", value, re.UNICODE)):
+            raise ValueError("Choose a supported metadata field and a canonical lowercase value from the catalog.")
+        definition = BUSINESS_FIELDS[key]
+        if definition["policy"] == "fixed" and value not in definition["values"]:
+            raise ValueError("Choose an accepted option for the fixed business_stage field.")
+        filters.append({"type": "eq", "key": key, "value": value})
+    return filters
+
+
 def hosted_search(*, api_key: str, vector_store_id: str, query: str,
-                  channel_ids: Sequence[str], max_results: int = 10) -> dict[str, Any]:
+                  channel_ids: Sequence[str], max_results: int = 10,
+                  metadata_filters: Mapping[str, str] | None = None,
+                  video_ids: Sequence[str] | None = None,
+                  rewrite_query: bool = False) -> dict[str, Any]:
     """Use OpenAI's managed retrieval with a mandatory hard channel filter."""
     store_id = _provider_id(vector_store_id, "vs_")
     if not isinstance(query, str) or not query.strip() or len(query) > 6000:
@@ -426,15 +452,140 @@ def hosted_search(*, api_key: str, vector_store_id: str, query: str,
         raise ValueError("Select one to ten canonical YouTube channel IDs.")
     if isinstance(max_results, bool) or not isinstance(max_results, int) or not 1 <= max_results <= 50:
         raise ValueError("max_results must be between 1 and 50.")
-    result = _request("POST", f"/vector_stores/{store_id}/search", api_key, payload={
-        "query": query.strip(), "filters": {"type": "in", "key": "channel_id", "value": scope},
-        "max_num_results": max_results,
-    })
+    if not isinstance(rewrite_query, bool):
+        raise ValueError("rewrite_query must be boolean.")
+    facets = _metadata_filters(metadata_filters)
+    selected_videos = None
+    if video_ids is not None:
+        if isinstance(video_ids, (str, bytes)):
+            raise ValueError("video_ids must be a list of exact YouTube video IDs.")
+        selected_videos = list(dict.fromkeys(video_ids))
+        if len(selected_videos) > 1000 or any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", v) for v in selected_videos):
+            raise ValueError("Select at most 1,000 exact YouTube video IDs.")
+        if not selected_videos:
+            return {"data": [], "search_performed": False, "reason": "No current indexed sources match the metadata selection."}
+    channel_filter = {"type": "in", "key": "channel_id", "value": scope}
+    constraints = [channel_filter, *facets]
+    if selected_videos is not None:
+        constraints.append({"type": "in", "key": "video_id", "value": selected_videos})
+    payload = {"query": query.strip(), "filters": {"type": "and", "filters": constraints} if len(constraints) > 1 else channel_filter,
+               "max_num_results": max_results}
+    if rewrite_query:
+        payload.update(rewrite_query=True, ranking_options={"ranker": "auto"})
+    result = _request("POST", f"/vector_stores/{store_id}/search", api_key, payload=payload)
     rows = result.get("data")
     if not isinstance(rows, list) or len(rows) > max_results:
         raise HostedRetrievalError("OpenAI returned an invalid search page.")
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("attributes"), dict) or row["attributes"].get("channel_id") not in scope:
             raise HostedRetrievalError("OpenAI returned an out-of-scope or unattributed search result.")
+        if any(row["attributes"].get(facet["key"]) != facet["value"] for facet in facets):
+            raise HostedRetrievalError("OpenAI returned a result outside the requested metadata filters.")
+        if selected_videos is not None and row["attributes"].get("video_id") not in selected_videos:
+            raise HostedRetrievalError("OpenAI returned a result outside the selected metadata source set.")
         _provider_id(row.get("file_id"), "file")
     return result
+
+
+def _latest_index_metadata(engine: Engine, content_id: int) -> tuple[int, dict[str, Any]] | None:
+    """Read explicit extraction output; legacy media defaults are not evidence of extraction."""
+    with engine.connect() as connection:
+        runs = Table("extraction_runs", MetaData(), autoload_with=connection)
+        rows = connection.execute(select(runs.c.run_id, runs.c.resolved_output).where(
+            runs.c.content_id == content_id, runs.c.status == "completed",
+        ).order_by(runs.c.run_id.desc())).mappings()
+        for row in rows:
+            resolved = row["resolved_output"]
+            metadata = resolved.get("index_metadata") if isinstance(resolved, dict) else None
+            if isinstance(metadata, dict):
+                return int(row["run_id"]), metadata
+    return None
+
+
+def sync_collection_metadata(*, engine: Engine, job_id: str, api_key: str,
+                             video_ids: Sequence[str], max_files: int = 10) -> dict[str, Any]:
+    """Refresh attributes on existing ready files, without reuploading or resuming acquisition.
+
+    A GET reconciles an uncertain prior update before any further mutation. All
+    source identity attributes are rebuilt and checked against the saved upload.
+    The collection/index state is preserved, including unrelated stopped work.
+    """
+    selected = list(dict.fromkeys(video_ids))
+    if not selected or len(selected) > 10 or any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", v) for v in selected):
+        raise ValueError("Select one to ten exact video IDs for metadata synchronization.")
+    if isinstance(max_files, bool) or not isinstance(max_files, int) or not 1 <= max_files <= 10:
+        raise ValueError("Metadata sync max_files must be between one and ten.")
+    repo = _IndexRepository(engine)
+    outcomes = []
+    with _collection_lock(engine, job_id) as check_lock:
+        checkpoint = repo.load(job_id)
+        manifest = checkpoint.get("hosted_index")
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+            raise HostedRetrievalError("No current hosted index exists for this collection.")
+        store_id = _provider_id(manifest.get("vector_store_id"), "vs_")
+        items = {item["video_id"]: item for item in checkpoint.get("items", [])}
+        for video_id in selected[:max_files]:
+            check_lock()
+            entry = manifest["files"].get(video_id)
+            item = items.get(video_id)
+            if not item or not isinstance(entry, dict) or entry.get("status") != "completed":
+                outcomes.append({"video_id": video_id, "status": "skipped", "reason": "Current index file is not ready."})
+                continue
+            document = repo.document(item)
+            if document is None:
+                raise HostedRetrievalError("Saved source is unavailable; metadata was not updated.")
+            _, base = source_document(document)
+            if entry.get("source_hash") != base["source_hash"] or str(entry.get("content_id")) != base["content_id"]:
+                raise HostedRetrievalError("Source changed since indexing; metadata was not updated.")
+            found = _latest_index_metadata(engine, int(document["content_id"]))
+            if found is None:
+                outcomes.append({"video_id": video_id, "status": "skipped", "reason": "No completed index metadata extraction."})
+                continue
+            run_id, extracted = found
+            content_hash = hashlib.sha256(str(document["full_text"]).strip().encode()).hexdigest()
+            if extracted.get("source_hash") != content_hash:
+                raise HostedRetrievalError("Metadata describes a different source version; no update was made.")
+            projected = extracted.get("openai_attributes")
+            from learn_from.metadata_catalog import project_openai_metadata
+            if not isinstance(projected, dict) or projected != project_openai_metadata(extracted):
+                raise HostedRetrievalError("Metadata projection is missing.")
+            _metadata_filters(projected)  # Same small scalar contract for writes and reads.
+            attributes = {**base, **projected, "metadata_run_id": str(run_id),
+                          "metadata_version": str(extracted.get("version") or "index-1.0")[:64]}
+            if len(attributes) > 16:
+                raise HostedRetrievalError("Metadata exceeds provider attribute limits.")
+            digest = hashlib.sha256(json.dumps(attributes, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            file_id = _provider_id(entry.get("file_id"), "file")
+            path = f"/vector_stores/{store_id}/files/{file_id}"
+            observed = _request("GET", path, api_key)
+            if observed.get("id") != file_id or observed.get("vector_store_id") != store_id or observed.get("status") != "completed":
+                raise HostedRetrievalError("Provider file is no longer ready; metadata was not updated.")
+            already_matches = observed.get("attributes") == attributes
+            state = {"status": "updating", "run_id": run_id, "attributes_hash": digest, "updated_at": _now()}
+            entry["metadata"] = state
+            repo.save(job_id, manifest)
+            try:
+                if not already_matches:
+                    check_lock()
+                    _request("POST", path, api_key, payload={"attributes": attributes})
+                    # Attribute changes may become visible after the update response.
+                    # Retry only reads; never repeat an uncertain mutation here.
+                    for attempt in range(5):
+                        check_lock()
+                        observed = _request("GET", path, api_key)
+                        if (observed.get("id") == file_id and observed.get("vector_store_id") == store_id
+                                and observed.get("status") == "completed" and observed.get("attributes") == attributes):
+                            break
+                        if attempt < 4:
+                            time.sleep(0.5)
+                if observed.get("id") != file_id or observed.get("vector_store_id") != store_id or observed.get("status") != "completed" or observed.get("attributes") != attributes:
+                    raise HostedRetrievalError("Provider metadata readback differs; reconciliation is required.")
+                state.update(status="synced", updated_at=_now(), attributes=attributes)
+                repo.save(job_id, manifest)
+                outcomes.append({"video_id": video_id, "status": "unchanged" if already_matches else "synced", "run_id": run_id, "attributes": attributes})
+            except HostedRetrievalError:
+                state.update(status="reconciliation_required", updated_at=_now())
+                repo.save(job_id, manifest)
+                raise
+    return {"job_id": job_id, "vector_store_id": store_id, "results": outcomes,
+            "requested_count": len(selected), "deferred_count": max(0, len(selected) - max_files)}
